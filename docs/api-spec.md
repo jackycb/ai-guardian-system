@@ -24,12 +24,16 @@ V1 默认采用“PIR 或 VAD 触发 -> 设备拍照/录音 -> 设备上传事�
 
 ### 2.2 鉴权
 
-V1 设备请求需带设备鉴权信息，当前建议采用以下其一，具体以实现为准：
+V1 设备请求需在 Header 中携带：
 
-- `Authorization: Bearer <device_token>`
-- `X-Device-Id: <device_id>` + `X-Device-Signature: <signature>`
+```
+Authorization: Bearer <device_token>
+```
 
-鉴权最终方案：待确认。
+鉴权失败统一返回 `401` + `code: 40101`（无论 Token 缺失或错误）。
+
+当服务端未配置 `DEVICE_TOKEN` 环境变量时，鉴权自动跳过（开发模式）。
+`/api/v1/health` 为公开端点，无需鉴权。
 
 ### 2.3 通用响应结构
 
@@ -316,17 +320,85 @@ curl -X POST "https://example.com/api/v1/device/events" \
 }
 ```
 
-## 6. V1 处理流程
+## 6. TTS 音频下载接口
 
-1. 设备调用 `/api/v1/health` 验证云端可用。
-2. PIR、VAD 或二者组合触发设备进入采集流程。
+### 6.1 接口定义
+
+- 方法：`GET`
+- 路径：`/api/v1/device/events/{event_id}/tts`
+
+### 6.2 用途
+
+设备在轮询结果得到 `status: done` 后，若响应中包含 `tts_audio_path` 字段，可请求该路径下载云端合成的语音播报音频（PCM 格式），通过 I2S 功放直接播放。
+
+### 6.3 路径参数
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `event_id` | string | 是 | 事件 ID |
+
+### 6.4 请求头
+
+| 名称 | 必填 | 说明 |
+| --- | --- | --- |
+| `Authorization` | 是（生产） | `Bearer <device_token>` |
+
+### 6.5 成功响应
+
+返回 `200 OK`，Body 为原始 PCM 音频流：
+
+- Content-Type: `application/octet-stream`
+- Content-Length: 音频字节数
+- 格式：PCM 16kHz / 16-bit / mono（小端序）
+
+设备收到后可直接通过 I2S 写入 MAX98357A 播放，无需解码。
+
+### 6.6 结果查询响应中的关联字段
+
+当分析完成且 TTS 音频已生成时，`/api/v1/device/events/{event_id}/result` 的 `data` 中会包含：
+
+```json
+{
+  "tts_audio_path": "/api/v1/device/events/evt_xxx/tts"
+}
+```
+
+设备应检查此字段是否存在，存在时请求下载并播放。
+
+### 6.7 失败响应
+
+事件不存在：
+
+```json
+{
+  "code": 40401,
+  "message": "event not found",
+  "data": null
+}
+```
+
+TTS 尚未生成（分析未完成或 TTS 合成失败）：
+
+```json
+{
+  "code": 40402,
+  "message": "tts audio not ready",
+  "data": null
+}
+```
+
+## 7. V1 处理流程
+
+1. 设备调用 `/api/v1/health` 验证云端可用（同时同步服务端时间）。
+2. PIR、VAD、按键或组合触发设备进入采集流程。
 3. 设备完成拍照和短音频录制，并调用 `/api/v1/device/events` 上传。
 4. 服务端返回 `event_id` 与初始状态 `queued`。
-5. 云端异步分析事件。
+5. 云端异步分析事件（ASR → 多模态 AI → TTS 合成）。
 6. 设备轮询 `/api/v1/device/events/{event_id}/result` 获取最终状态与结果。
-7. 设备读取 `voice_broadcast_text` 并通过 MAX98357A + 3W 喇叭进行语音播报。
+7. 若结果中包含 `tts_audio_path`，设备请求 `/api/v1/device/events/{event_id}/tts` 下载 PCM 音频。
+8. 设备通过 I2S 功放播放 TTS 音频；若 TTS 不可用则播放本地提示音作为 fallback。
 
-## 7. 待确认项
+## 8. 待确认项
 
 - 是否需要单独的设备注册接口
 - 健康检查接口是否要求鉴权
